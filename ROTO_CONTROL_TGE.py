@@ -8,6 +8,16 @@
 # liability, whether in an action of contract, tort, or otherwise, arising from,
 # out of, or in connection with the software or the use or other dealings in the
 # software.
+#
+# PATCH v2.0.0+fix1:
+# Fixed spurious Rotocontrol display redraws caused by third-party VST3 plugins
+# (e.g. Softube Flow) calling restartComponent/setDirty from a non-UI thread on
+# knob touch, which caused Ableton to rebuild the plugin's parameter list and
+# fire the shared _on_parameters_changed callback, triggering a full redraw even
+# when the affected device was not the selected one.
+# Fix: replaced shared _on_parameters_changed callback with per-device closures
+# that only trigger a redraw when the device whose parameters changed is the
+# currently selected device.
 
 from __future__ import absolute_import, print_function, unicode_literals
 import Live
@@ -104,33 +114,33 @@ MACRO_FORCE_PLUGIN = 0
 HAPTIC_CENTER_INDENT = 0
 
 UNIQUE_DEVICE_CLASS_NAMES = [
- 'InstrumentGroupDevice',
- 'DrumGroupDevice',
- 'AudioEffectGroupDevice',
- 'MidiEffectGroupDevice',
- 'ProxyInstrumentDevice',
- 'ProxyAudioEffectDevice',
- 'PluginDevice',
- 'AuPluginDevice',
- 'MxDeviceInstrument',
- 'MxDeviceAudioEffect',
- 'MxDeviceMidiEffect']
+    'InstrumentGroupDevice',
+    'DrumGroupDevice',
+    'AudioEffectGroupDevice',
+    'MidiEffectGroupDevice',
+    'ProxyInstrumentDevice',
+    'ProxyAudioEffectDevice',
+    'PluginDevice',
+    'AuPluginDevice',
+    'MxDeviceInstrument',
+    'MxDeviceAudioEffect',
+    'MxDeviceMidiEffect']
 
 MACRO_DEVICE_CLASS_NAMES = [
- 'InstrumentGroupDevice',
- 'AudioEffectGroupDevice',
- 'MidiEffectGroupDevice',
- 'DrumGroupDevice']
+    'InstrumentGroupDevice',
+    'AudioEffectGroupDevice',
+    'MidiEffectGroupDevice',
+    'DrumGroupDevice']
 
 MACRO_PLUGIN_W_LIST = [
-'InstrumentMeld'
+    'InstrumentMeld'
 ]
 
 MACRO_DEFAULT_NAMES = [
-'Instrument Rack',
-'Audio Effect Rack',
-'MIDI Effect Rack',
-'Drum Rack' ]
+    'Instrument Rack',
+    'Audio Effect Rack',
+    'MIDI Effect Rack',
+    'Drum Rack' ]
 
 MACRO_DEVICE_NAME = 'MIMacroDefaultDevice'
 
@@ -183,6 +193,7 @@ class RotoControl(ControlSurface):
             self._update_listener_track_list = []
             self._last_detail_change_track_list = []
             self._detail_change_device_list = []
+            self._parameters_listener_list = {}  # PATCHED: per-device parameters listeners
             self._timer_interval = 5        # Set timer interval (5 ticks = 0.5 second)
             self._visible_track_mask = 0
             self._current_track_mask = 0
@@ -209,7 +220,7 @@ class RotoControl(ControlSurface):
             self._log_print('_encoder_cc_list[{}]: {}'.format(ix, self._encoder_cc_list[ix]), LOG_VERBOSE)
             self._log_print('_button_cc_list[{}]: {}'.format(ix, self._button_cc_list[ix]), LOG_VERBOSE)
             self._log_print('_transport_button_cc_list[{}]: {}'.format(ix, self._transport_button_cc_list[ix]), LOG_VERBOSE)
-        
+
         # Add 2 additional transport controls for arrow keys
         ix = NUM_ENCODERS
         while ix < (NUM_ENCODERS + 2):
@@ -296,7 +307,7 @@ class RotoControl(ControlSurface):
                 self._clear_mixer_params()
 
                 for ix in range(NUM_ENCODERS):
-                    current_track = self._get_mixer_first_track() + ix 
+                    current_track = self._get_mixer_first_track() + ix
                     if current_track < total_tracks:
                         self._log_print('Track: {}, Offset: {}'.format(current_track, ix), LOG_VERBOSE)
                         mixer_device = track_list[current_track].mixer_device
@@ -456,12 +467,31 @@ class RotoControl(ControlSurface):
                 track.remove_arm_listener(listener)
         self._arm_listener_list = []
 
-    def _update_devices(self):
-        # Show the selected device, if any
-        import traceback
-        self.log_message('DEBUG _update_devices:\n' + ''.join(traceback.format_stack(limit=5)))
-        self._log_print('DEBUG _update_devices:\n' + ''.join(traceback.format_stack(limit=5)))
+    # PATCHED: per-device parameters listener cleanup
+    def _clear_parameters_listeners(self):
+        for device, listener in list(self._parameters_listener_list.items()):
+            try:
+                if device.parameters_has_listener(listener):
+                    device.remove_parameters_listener(listener)
+            except:
+                pass
+        self._parameters_listener_list = {}
 
+    # PATCHED: per-device parameters listener factory
+    # Only triggers a redraw when the device whose parameters changed is the
+    # currently selected device, ignoring spurious restartComponent/setDirty
+    # calls from other plugins (e.g. Softube Flow VST3 on knob touch).
+    def _get_parameters_changed_listener(self, device):
+        def _on_parameters_changed():
+            if device == self._get_selected_device():
+                self._RotoControl__on_selected_device_changed()
+        return _on_parameters_changed
+
+    def _update_devices(self):
+        # PATCHED: clear stale per-device parameters listeners before re-registering
+        self._clear_parameters_listeners()
+
+        # Show the selected device, if any
         selected_device = self.song().view.selected_track.view.selected_device
         if selected_device != None:
             self._log_print('Selected device: ' + str((selected_device.class_name, selected_device.name)))
@@ -477,7 +507,7 @@ class RotoControl(ControlSurface):
         self._send_sysex(PLUGIN_COMMAND_GROUP, FIRST_DEVICE, bytearray([self._plugin_first_device]))
         self._process_return_plugin_names(plugin_names)
 
-        # Walk the list of devices - add listeners if they doesnt exist
+        # Walk the list of devices - add listeners if they don't exist
         devices = self.get_expanded_device_list()
         if not self._is_live_v10():
             for device in devices:
@@ -485,8 +515,11 @@ class RotoControl(ControlSurface):
                     device.add_name_listener(self._on_device_name_changed)
                 if not device.is_active_has_listener(self._on_device_is_active_changed):
                     device.add_is_active_listener(self._on_device_is_active_changed)
-                if not device.parameters_has_listener(self._on_parameters_changed):
-                    device.add_parameters_listener(self._on_parameters_changed)
+                # PATCHED: use per-device closure instead of shared callback
+                if device not in self._parameters_listener_list:
+                    listener = self._get_parameters_changed_listener(device)
+                    self._parameters_listener_list[device] = listener
+                    device.add_parameters_listener(listener)
                 if self._device_is_macro_rack(device.class_name):
                     if not device.macros_mapped_has_listener(self._on_macro_map_changed):
                         device.add_macros_mapped_listener(self._on_macro_map_changed)
@@ -496,7 +529,11 @@ class RotoControl(ControlSurface):
                     self._detail_change_device_list.append(device)
                     device.add_name_listener(self._on_device_name_changed)
                     device.add_is_active_listener(self._on_device_is_active_changed)
-                    device.add_parameters_listener(self._on_parameters_changed)
+                    # PATCHED: use per-device closure instead of shared callback
+                    if device not in self._parameters_listener_list:
+                        listener = self._get_parameters_changed_listener(device)
+                        self._parameters_listener_list[device] = listener
+                        device.add_parameters_listener(listener)
 
     def get_expanded_device_list(self):
         # Get the list of devices on the selected track including all chained and nested devices
@@ -592,7 +629,7 @@ class RotoControl(ControlSurface):
             else:
                 data = bytearray([MIDI_CC_MSG, self._button_cc_list[index], 0])
                 self._send_midi(tuple(data))
-        
+
         return _on_solo_state_changed
 
     # Returns a function to toggle the arm state of a specific track based on the button index.
@@ -1033,9 +1070,6 @@ class RotoControl(ControlSurface):
             self._update_devices()
             self._is_active_start_time = time()
 
-    def _on_parameters_changed(self):
-        self._RotoControl__on_selected_device_changed()
-
     def _on_macro_map_changed(self):
         # Only run this if the selected device is a rack to avoid unneccessary updates
         if self._device_is_macro_rack(self._get_selected_device().class_name):
@@ -1150,7 +1184,7 @@ class RotoControl(ControlSurface):
                 self._active_mode = 'PLUGIN'
 
                 self._clear_mixer_params()
-                
+
                 # If learning
                 if self._learn_mode_enabled == True:
                     # Turn device learn mode OFF
@@ -1305,7 +1339,7 @@ class RotoControl(ControlSurface):
                             if param_mapped:
                                 self._encoder_list[data[9]].connect_to(param)
                         elif (data[8] == 1):
-                                # Param -> switch control learned
+                            # Param -> switch control learned
                             self._button_list[data[9]].release_parameter()
                             if param_mapped:
                                 self._button_list[data[9]].connect_to(param)
@@ -1399,7 +1433,7 @@ class RotoControl(ControlSurface):
                 elif (data[2] == 0x2):
                     self._mixer_button_mode = 'ARM_RECORDING'
                     self._log_print('Change Button - {}'.format(self._mixer_button_mode), LOG_VERBOSE)
-                
+
                 # Update the mixer
                 mixer_update = True
 
@@ -1429,7 +1463,7 @@ class RotoControl(ControlSurface):
                 else:
                     self._channel_mode = 'AUDIO'
 
-                self._log_print('Channel mode: {}'.format(self._channel_mode), LOG_VERBOSE)
+                self._log_print('Channel mode: {}'.format(self._channel_mode))
                 mixer_update = True
 
             elif (command_id == TOGGLE_GROUP_TRACK):
@@ -1463,7 +1497,7 @@ class RotoControl(ControlSurface):
         plugin_names = []
         devices = self.get_expanded_device_list()
         for ix in range(NUM_ENCODERS):
-            current_plugin = self._plugin_first_device + ix 
+            current_plugin = self._plugin_first_device + ix
             if current_plugin < len(devices):
                 device = devices[current_plugin]
                 plugin_names.append((device.class_name, device.name))
@@ -1572,7 +1606,7 @@ class RotoControl(ControlSurface):
         track_list = self._get_track_list()
 
         for ix in range(NUM_ENCODERS):
-            _current_track = self._get_mixer_first_track() + ix 
+            _current_track = self._get_mixer_first_track() + ix
             if _current_track < len(track_list):
                 track_names.append(track_list[_current_track].name)
         return track_names
@@ -1632,15 +1666,14 @@ class RotoControl(ControlSurface):
     def _rack_has_default_name(self, device_name):
         return device_name in MACRO_DEFAULT_NAMES
 
-    # Check if we are in Live 10 to hande API differences
+    # Check if we are in Live 10 to handle API differences
     def _is_live_v10(self):
         version = Live.Application.get_application().get_major_version()
         return (version == 10)
 
-    # Process and format track names in preparation for sending
     def _send_sysex(self, sub_id_1, sub_id_2, data):
         # Create the SYSEX command to send
-        midi_bytes = bytearray([MIDI_SYSEX_HEADER, 
+        midi_bytes = bytearray([MIDI_SYSEX_HEADER,
                                 MI_MANUFACTURER_ID[0], MI_MANUFACTURER_ID[1], MI_MANUFACTURER_ID[2], ROTO_CONTROL_DEVICE_ID,
                                 sub_id_1, sub_id_2])
         if len(data):

@@ -1070,6 +1070,9 @@ class RotoControl(ControlSurface):
             self._update_devices()
             self._is_active_start_time = time()
 
+    def _on_parameters_changed(self):
+        self._RotoControl__on_selected_device_changed()
+
     def _on_macro_map_changed(self):
         # Only run this if the selected device is a rack to avoid unneccessary updates
         if self._device_is_macro_rack(self._get_selected_device().class_name):
@@ -1312,7 +1315,7 @@ class RotoControl(ControlSurface):
                                 self._learn_parameter(param, selected_device, param_index_original, False, param_hash)
                         else:
                             param_index = None
-                    else:
+                    elif len(selected_device.parameters) > param_index:
                         param = selected_device.parameters[param_index]
                         # Update the name of each macro as they are discovered if the macro is mapped.
                         if self._device_is_macro_rack(selected_device.class_name):
@@ -1329,6 +1332,8 @@ class RotoControl(ControlSurface):
                             if not self._is_live_v10():
                                 if not param.name_has_listener(self._on_param_name_changed):
                                     param.add_name_listener(self._on_param_name_changed)
+                    else:
+                        param_index = None
 
                     if (param_index != None):
                         # Knob = 0, Switch = 1
@@ -1463,7 +1468,7 @@ class RotoControl(ControlSurface):
                 else:
                     self._channel_mode = 'AUDIO'
 
-                self._log_print('Channel mode: {}'.format(self._channel_mode))
+                self._log_print('Channel mode: {}'.format(self._channel_mode), LOG_VERBOSE)
                 mixer_update = True
 
             elif (command_id == TOGGLE_GROUP_TRACK):
@@ -1671,6 +1676,7 @@ class RotoControl(ControlSurface):
         version = Live.Application.get_application().get_major_version()
         return (version == 10)
 
+    # Process and format track names in preparation for sending
     def _send_sysex(self, sub_id_1, sub_id_2, data):
         # Create the SYSEX command to send
         midi_bytes = bytearray([MIDI_SYSEX_HEADER,
